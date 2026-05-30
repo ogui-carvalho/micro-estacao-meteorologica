@@ -1,7 +1,7 @@
 # Micro Estação Meteorológica com ESP32 e MQTT
 
 **Universidade Presbiteriana Mackenzie — Análise e Desenvolvimento de Sistemas — 2026**  
-**Autor:** Raphael Dionisio Vieira de Figueiredo Lima  
+**Autor:** Guilherme Oliveira Carvalho
 **ODS 11:** Cidades e Comunidades Sustentáveis
 
 ---
