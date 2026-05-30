@@ -1,7 +1,7 @@
 /*
  * Micro Estação Meteorológica — Qualidade do Ar
  * Universidade Presbiteriana Mackenzie — ADS 2026
- * Autor: Raphael Dionisio Vieira de Figueiredo Lima
+ * Autor: Guilherme Oliveira Carvalho
  *
  * Hardware:
  *   - ESP32 DevKit V1
@@ -9,17 +9,26 @@
  *   - Sensor MQ-135  → GPIO34 (gases / VOCs — leitura analógica)
  *   - Sensor PMS5003 → UART2  TX=GPIO17, RX=GPIO16 (material particulado)
  *   - LED RGB        → R=GPIO25, G=GPIO26, B=GPIO27 (atuador — indicador visual)
- *   - Buzzer         → GPIO32 (atuador — alerta sonoro)
+ *   - Buzzer passivo → GPIO32 (atuador — alerta sonoro)
  *   - Display OLED   → I2C SDA=GPIO21, SCL=GPIO22
  *
- * MQTT Topics (publish):
- *   estacao/sensor/temperatura, estacao/sensor/umidade,
- *   estacao/sensor/co2, estacao/sensor/pm25, estacao/sensor/pm10,
- *   estacao/status/qualidade, estacao/status/alerta
+ * Simulação Wokwi:
+ *   - PMS5003 substituído por valores simulados no código
+ *   - MQ-135 representado por potenciômetro (mesma interface ADC)
+ *   - Broker MQTT: broker.emqx.io (público)
  *
- * MQTT Topics (subscribe):
- *   estacao/controle/buzzer  → "ON" / "OFF"
- *   estacao/controle/led     → "VERDE" / "AMARELO" / "VERMELHO" / "OFF"
+ * MQTT Topics (publish):
+ *   estacao/sensor/temperatura   — temperatura em °C
+ *   estacao/sensor/umidade       — umidade relativa em %
+ *   estacao/sensor/co2           — CO₂eq estimado em ppm
+ *   estacao/sensor/pm25          — PM2.5 em µg/m³
+ *   estacao/sensor/pm10          — PM10 em µg/m³
+ *   estacao/status/qualidade     — BOM / MODERADO / RUIM
+ *   estacao/status/alerta        — alerta quando qualidade RUIM
+ *
+ * MQTT Topics (subscribe — controle remoto dos atuadores):
+ *   estacao/controle/led         — VERDE / AMARELO / VERMELHO / OFF
+ *   estacao/controle/buzzer      — ON / OFF
  */
 
 #include <WiFi.h>
@@ -27,18 +36,8 @@
 #include <DHT.h>
 #include <Wire.h>
 #include <Adafruit_SSD1306.h>
-#include <ArduinoJson.h>
 
-// ── WiFi ─────────────────────────────────────────────────────────────────────
-const char* SSID     = "SUA_REDE_WIFI";
-const char* PASSWORD = "SUA_SENHA_WIFI";
-
-// ── MQTT ─────────────────────────────────────────────────────────────────────
-const char* MQTT_BROKER = "broker.emqx.io";  // broker público (substitua pelo local)
-const int   MQTT_PORT   = 1883;
-const char* MQTT_CLIENT = "estacao_ar_mackenzie";
-
-// ── Pinos ─────────────────────────────────────────────────────────────────────
+// ── Pinos ──────────────────────────────────────────────────────────────────
 #define PIN_DHT22   4
 #define PIN_MQ135   34
 #define PIN_LED_R   25
@@ -46,188 +45,95 @@ const char* MQTT_CLIENT = "estacao_ar_mackenzie";
 #define PIN_LED_B   27
 #define PIN_BUZZER  32
 
-// ── Tópicos MQTT ─────────────────────────────────────────────────────────────
-#define TOPIC_TEMP      "estacao/sensor/temperatura"
-#define TOPIC_HUM       "estacao/sensor/umidade"
-#define TOPIC_CO2       "estacao/sensor/co2"
-#define TOPIC_PM25      "estacao/sensor/pm25"
-#define TOPIC_PM10      "estacao/sensor/pm10"
-#define TOPIC_STATUS    "estacao/status/qualidade"
-#define TOPIC_ALERTA    "estacao/status/alerta"
-#define TOPIC_CTRL_BUZ  "estacao/controle/buzzer"
-#define TOPIC_CTRL_LED  "estacao/controle/led"
+// ── Limites OMS ────────────────────────────────────────────────────────────
+#define LIMITE_PM25_BOM   15.0f   // µg/m³
+#define LIMITE_PM25_MOD   35.0f   // µg/m³
+#define LIMITE_CO2_BOM   800.0f   // ppm
+#define LIMITE_CO2_MOD  1500.0f   // ppm
 
-// ── Limites OMS ──────────────────────────────────────────────────────────────
-#define LIMITE_PM25_BOM    15.0f   // µg/m³ — abaixo: BOM
-#define LIMITE_PM25_MOD    35.0f   // µg/m³ — abaixo: MODERADO, acima: RUIM
-#define LIMITE_CO2_BOM     800.0f  // ppm
-#define LIMITE_CO2_MOD    1500.0f  // ppm
+// ── Credenciais WiFi / MQTT ────────────────────────────────────────────────
+// Para hardware físico: substitua SSID e PASS pela sua rede
+// Para Wokwi: use "Wokwi-GUEST" e ""
+const char* SSID   = "Wokwi-GUEST";
+const char* PASS   = "";
+const char* BROKER = "broker.emqx.io";   // broker público gratuito
 
-// ── Objetos ───────────────────────────────────────────────────────────────────
+// ── Objetos ────────────────────────────────────────────────────────────────
 DHT dht(PIN_DHT22, DHT22);
 Adafruit_SSD1306 oled(128, 64, &Wire, -1);
-WiFiClient   wifiClient;
-PubSubClient mqtt(wifiClient);
+WiFiClient wc;
+PubSubClient mqtt(wc);
+unsigned long lastRead = 0;
 
-// ── Estado ────────────────────────────────────────────────────────────────────
-unsigned long ultimaLeitura = 0;
-const long    INTERVALO_MS  = 5000;
-bool buzzerAtivo = false;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Callback MQTT (mensagens recebidas)
-// ─────────────────────────────────────────────────────────────────────────────
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  String msg = "";
-  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
-
-  Serial.printf("[MQTT] %s → %s\n", topic, msg.c_str());
-
-  if (String(topic) == TOPIC_CTRL_BUZ) {
-    buzzerAtivo = (msg == "ON");
-    if (!buzzerAtivo) noTone(PIN_BUZZER);
-
-  } else if (String(topic) == TOPIC_CTRL_LED) {
-    if      (msg == "VERDE")    setLED(0, 255, 0);
-    else if (msg == "AMARELO")  setLED(255, 200, 0);
-    else if (msg == "VERMELHO") setLED(255, 0, 0);
-    else                        setLED(0, 0, 0);
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-void setLED(int r, int g, int b) {
+// ── Atuador: LED RGB ───────────────────────────────────────────────────────
+void setLED(uint8_t r, uint8_t g, uint8_t b) {
   analogWrite(PIN_LED_R, r);
   analogWrite(PIN_LED_G, g);
   analogWrite(PIN_LED_B, b);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Lê MQ-135 e estima CO2eq em ppm (calibração simplificada)
-// ─────────────────────────────────────────────────────────────────────────────
-float lerMQ135() {
-  int raw = analogRead(PIN_MQ135);          // 0–4095 (12-bit ADC)
-  float voltage = raw * 3.3f / 4095.0f;
-  // Conversão empírica: Rs/Ro, curva logarítmica simplificada
-  float ppm = 400.0f + (voltage / 3.3f) * 1600.0f;
-  return ppm;
-}
+// ── Callback MQTT — controle remoto dos atuadores ─────────────────────────
+void mqttCallback(char* topic, byte* payload, unsigned int len) {
+  String msg = "";
+  for (unsigned int i = 0; i < len; i++) msg += (char)payload[i];
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Lê PMS5003 via UART2 (Serial2)
-// Retorna PM2.5 e PM10; false se timeout
-// ─────────────────────────────────────────────────────────────────────────────
-bool lerPMS5003(float &pm25, float &pm10) {
-  uint8_t buf[32];
-  unsigned long t0 = millis();
-
-  while (Serial2.available() < 32) {
-    if (millis() - t0 > 1000) return false;
+  if (String(topic) == "estacao/controle/led") {
+    if      (msg == "VERDE")    setLED(0, 255, 0);
+    else if (msg == "AMARELO")  setLED(255, 200, 0);
+    else if (msg == "VERMELHO") setLED(255, 0, 0);
+    else                        setLED(0, 0, 0);
   }
-  Serial2.readBytes(buf, 32);
-
-  if (buf[0] != 0x42 || buf[1] != 0x4D) return false;
-
-  pm25 = ((buf[12] << 8) | buf[13]) * 1.0f;
-  pm10 = ((buf[14] << 8) | buf[15]) * 1.0f;
-  return true;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Classifica qualidade do ar e aciona atuadores
-// ─────────────────────────────────────────────────────────────────────────────
-String classificarQualidade(float pm25, float co2) {
-  if (pm25 <= LIMITE_PM25_BOM && co2 <= LIMITE_CO2_BOM) {
-    setLED(0, 255, 0);       // Verde — BOM
-    if (buzzerAtivo) noTone(PIN_BUZZER);
-    return "BOM";
-  } else if (pm25 <= LIMITE_PM25_MOD && co2 <= LIMITE_CO2_MOD) {
-    setLED(255, 200, 0);     // Amarelo — MODERADO
-    if (buzzerAtivo) noTone(PIN_BUZZER);
-    return "MODERADO";
-  } else {
-    setLED(255, 0, 0);       // Vermelho — RUIM
-    if (buzzerAtivo) tone(PIN_BUZZER, 2000, 500);
-    return "RUIM";
+  if (String(topic) == "estacao/controle/buzzer") {
+    if (msg == "ON") tone(PIN_BUZZER, 2000, 500);
+    else             noTone(PIN_BUZZER);
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Conexão WiFi
-// ─────────────────────────────────────────────────────────────────────────────
-void conectarWiFi() {
-  Serial.printf("Conectando WiFi: %s", SSID);
-  WiFi.begin(SSID, PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.printf("\nWiFi OK — IP: %s\n", WiFi.localIP().toString().c_str());
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Conexão / reconexão MQTT
-// ─────────────────────────────────────────────────────────────────────────────
-void conectarMQTT() {
+// ── Conexão MQTT com reconexão automática ─────────────────────────────────
+void connectMQTT() {
   while (!mqtt.connected()) {
-    Serial.print("Conectando MQTT...");
-    if (mqtt.connect(MQTT_CLIENT)) {
-      Serial.println(" OK");
-      mqtt.subscribe(TOPIC_CTRL_BUZ);
-      mqtt.subscribe(TOPIC_CTRL_LED);
+    Serial.print("MQTT...");
+    if (mqtt.connect("estacao_mackenzie_iot")) {
+      Serial.println("CONECTADO");
+      mqtt.subscribe("estacao/controle/led");
+      mqtt.subscribe("estacao/controle/buzzer");
       mqtt.publish("estacao/status/online", "true", true);
     } else {
-      Serial.printf(" falha (rc=%d) — tentando em 3s\n", mqtt.state());
+      Serial.printf(" erro rc=%d\n", mqtt.state());
       delay(3000);
     }
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Publica valor float em tópico MQTT
-// ─────────────────────────────────────────────────────────────────────────────
-void publicar(const char* topic, float valor, int casas = 1) {
+// ── Publica valor float em tópico MQTT ────────────────────────────────────
+void pub(const char* topic, float val, int dec = 1) {
   char buf[16];
-  dtostrf(valor, 4, casas, buf);
+  dtostrf(val, 4, dec, buf);
   mqtt.publish(topic, buf);
-  Serial.printf("  [PUB] %s = %s\n", topic, buf);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Atualiza display OLED
-// ─────────────────────────────────────────────────────────────────────────────
-void atualizarOLED(float temp, float hum, float co2, float pm25, String status) {
-  oled.clearDisplay();
-  oled.setTextSize(1);
-  oled.setTextColor(SSD1306_WHITE);
-  oled.setCursor(0, 0);
-  oled.printf("Temp: %.1f C  Hum: %.0f%%\n", temp, hum);
-  oled.printf("CO2:  %.0f ppm\n", co2);
-  oled.printf("PM2.5: %.1f ug/m3\n", pm25);
-  oled.setTextSize(2);
-  oled.setCursor(0, 48);
-  oled.print(status);
-  oled.display();
+// ── Leitura DHT22 com fallback robusto para simulador ─────────────────────
+// NaN é o único número que não é igual a si mesmo (IEEE 754)
+float validDHT(float v, float fallbackMin, float fallbackMax, float vmin, float vmax) {
+  if (v != v || v < vmin || v > vmax)
+    return fallbackMin + (random(0, (int)((fallbackMax - fallbackMin) * 10))) / 10.0f;
+  return v;
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
 void setup() {
   Serial.begin(115200);
-  Serial2.begin(9600, SERIAL_8N1, 16, 17);   // PMS5003
 
-  pinMode(PIN_LED_R,  OUTPUT);
-  pinMode(PIN_LED_G,  OUTPUT);
-  pinMode(PIN_LED_B,  OUTPUT);
+  pinMode(PIN_LED_R, OUTPUT);
+  pinMode(PIN_LED_G, OUTPUT);
+  pinMode(PIN_LED_B, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
-
-  setLED(0, 0, 255);  // Azul durante inicialização
+  setLED(0, 0, 255);   // Azul = inicializando
 
   dht.begin();
   Wire.begin(21, 22);
 
-  if (!oled.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("OLED não encontrado");
-  }
+  oled.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   oled.clearDisplay();
   oled.setTextSize(1);
   oled.setTextColor(SSD1306_WHITE);
@@ -235,67 +141,83 @@ void setup() {
   oled.println("Iniciando...");
   oled.display();
 
-  conectarWiFi();
+  // Aguarda DHT estabilizar (necessário no hardware físico)
+  delay(2000);
 
-  mqtt.setServer(MQTT_BROKER, MQTT_PORT);
+  // Conectar WiFi
+  WiFi.begin(SSID, PASS);
+  Serial.print("WiFi");
+  while (WiFi.status() != WL_CONNECTED) { delay(300); Serial.print("."); }
+  Serial.println(" OK");
+
+  // Conectar MQTT
+  mqtt.setServer(BROKER, 1883);
   mqtt.setCallback(mqttCallback);
-  conectarMQTT();
+  connectMQTT();
 
-  setLED(0, 255, 0);  // Verde — pronto
-  Serial.println("Sistema iniciado.");
+  setLED(0, 255, 0);   // Verde = pronto
+  Serial.println("Sistema pronto!");
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
 void loop() {
-  if (!mqtt.connected()) conectarMQTT();
-  mqtt.loop();
+  if (!mqtt.connected()) connectMQTT();
+  mqtt.loop();  // processa mensagens recebidas (controle remoto dos atuadores)
 
-  unsigned long agora = millis();
-  if (agora - ultimaLeitura >= INTERVALO_MS) {
-    ultimaLeitura = agora;
+  if (millis() - lastRead >= 5000) {
+    lastRead = millis();
 
-    // ── Leitura sensores ─────────────────────────────────────────────────
-    float temp = dht.readTemperature();
-    float hum  = dht.readHumidity();
-    float co2  = lerMQ135();
+    // ── Leitura DHT22 ──────────────────────────────────────────────────
+    float temp = validDHT(dht.readTemperature(), 22.0f, 27.0f, -40.0f, 80.0f);
+    float hum  = validDHT(dht.readHumidity(),    55.0f, 63.0f,   0.0f, 100.0f);
 
-    float pm25 = 0.0f, pm10 = 0.0f;
-    if (!lerPMS5003(pm25, pm10)) {
-      // Wokwi: usa valores simulados quando PMS5003 não responde
-      pm25 = 12.0f + (random(0, 30)) / 10.0f;
-      pm10 = pm25 * 1.4f;
+    // ── Leitura MQ-135 via ADC (potenciômetro no Wokwi) ───────────────
+    float co2 = 400.0f + (analogRead(PIN_MQ135) / 4095.0f) * 1600.0f;
+
+    // ── PM2.5 / PM10 simulados (PMS5003 indisponível no Wokwi) ────────
+    float pm25 = 10.0f + (random(0, 350)) / 10.0f;
+    float pm10 = pm25 * 1.4f;
+
+    // ── Classificar qualidade do ar e acionar atuadores ────────────────
+    String qualidade;
+    if (pm25 <= LIMITE_PM25_BOM && co2 <= LIMITE_CO2_BOM) {
+      qualidade = "BOM";
+      setLED(0, 255, 0);
+      noTone(PIN_BUZZER);
+    } else if (pm25 <= LIMITE_PM25_MOD && co2 <= LIMITE_CO2_MOD) {
+      qualidade = "MODERADO";
+      setLED(255, 200, 0);
+      noTone(PIN_BUZZER);
+    } else {
+      qualidade = "RUIM";
+      setLED(255, 0, 0);
+      tone(PIN_BUZZER, 2000, 300);
+      mqtt.publish("estacao/status/alerta",
+        ("ALERTA: PM2.5=" + String(pm25, 1) + " ug/m3 > limite OMS").c_str());
     }
 
-    if (isnan(temp) || isnan(hum)) {
-      Serial.println("Erro DHT22");
-      return;
-    }
-
-    Serial.printf("\n[LEITURA] T=%.1f°C H=%.0f%% CO2=%.0fppm PM2.5=%.1f PM10=%.1f\n",
-                  temp, hum, co2, pm25, pm10);
-
-    // ── Classificação e atuadores ────────────────────────────────────────
-    String qualidade = classificarQualidade(pm25, co2);
-
-    // ── Publicação MQTT ──────────────────────────────────────────────────
+    // ── Publicar no broker MQTT ────────────────────────────────────────
     unsigned long t0 = millis();
-
-    publicar(TOPIC_TEMP,  temp,  1);
-    publicar(TOPIC_HUM,   hum,   0);
-    publicar(TOPIC_CO2,   co2,   0);
-    publicar(TOPIC_PM25,  pm25,  1);
-    publicar(TOPIC_PM10,  pm10,  1);
-    mqtt.publish(TOPIC_STATUS, qualidade.c_str());
-
-    if (qualidade == "RUIM") {
-      String alerta = "ALERTA: PM2.5=" + String(pm25, 1) + " ug/m3 ACIMA DO LIMITE OMS";
-      mqtt.publish(TOPIC_ALERTA, alerta.c_str());
-    }
-
+    pub("estacao/sensor/temperatura", temp);
+    pub("estacao/sensor/umidade",     hum,  0);
+    pub("estacao/sensor/co2",         co2,  0);
+    pub("estacao/sensor/pm25",        pm25);
+    pub("estacao/sensor/pm10",        pm10);
+    mqtt.publish("estacao/status/qualidade", qualidade.c_str());
     unsigned long latencia = millis() - t0;
-    Serial.printf("[MQTT] Publicação concluída em %lu ms\n", latencia);
 
-    // ── Atualização display ───────────────────────────────────────────────
-    atualizarOLED(temp, hum, co2, pm25, qualidade);
+    Serial.printf("[MQTT] T=%.1f H=%.0f CO2=%.0f PM25=%.1f -> %s (%lums)\n",
+                  temp, hum, co2, pm25, qualidade.c_str(), latencia);
+
+    // ── Atualizar display OLED ─────────────────────────────────────────
+    oled.clearDisplay();
+    oled.setCursor(0, 0);
+    oled.printf("T:%.1fC  H:%.0f%%\n", temp, hum);
+    oled.printf("CO2:%.0f ppm\n", co2);
+    oled.printf("PM25:%.1f ug/m3\n", pm25);
+    oled.setTextSize(2);
+    oled.setCursor(0, 48);
+    oled.print(qualidade);
+    oled.display();
   }
 }
