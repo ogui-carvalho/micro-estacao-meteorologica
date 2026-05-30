@@ -1,0 +1,19 @@
+firmware/micro_estacao.ino
+  s_16939313b5935b::t_3cc483e07f6805 4,12,15-19,21-27,29-31,40,48-52,54-59,61,64-66,68-73,75-76,78,80,86-88,92-93,95-99,102,108-109,111,115-120,123,127-129,131,136,144-151,153-154,156,158-159,162,164-196,199,201-206,209-221
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "55b2caf0bb2c05eb7a8ea7a29f8b0bde6d60b81b",
+  "prompts": {},
+  "sessions": {
+    "s_16939313b5935b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c8c6364a-c3e1-4d88-b7ef-7751dcf8353d",
+        "model": "claude-sonnet-4-6"
+      },
+      "human_author": "ogui-carvalho <ogui-carvalho@users.noreply.github.com>"
+    }
+  }
+}
